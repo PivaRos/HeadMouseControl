@@ -1,9 +1,11 @@
+// AppDelegate.swift
+
 import Cocoa
 import CoreMotion
 
-// 1) Define a notification name for calibration
 extension Notification.Name {
-    static let headMouseCalibrate = Notification.Name("HeadMouseControlCalibrate")
+    static let headMouseCalibrate          = Notification.Name("HeadMouseControlCalibrate")
+    static let headMouseSensitivityChanged = Notification.Name("HeadMouseControlSensitivityChanged")
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate, CMHeadphoneMotionManagerDelegate {
@@ -12,76 +14,107 @@ class AppDelegate: NSObject, NSApplicationDelegate, CMHeadphoneMotionManagerDele
     private let queue = OperationQueue()
     private var currentMotion: CMDeviceMotion?
 
+    /// whether we should control the cursor by head motion
+    private var isHeadControlEnabled = false
+
     // MARK: – Calibration
     private var calibrationYaw:   Double = 0
     private var calibrationPitch: Double = 0
     private var isCalibrated = false
 
-    // MARK: – Click Gesture
-    private var lastPitch = 0.0
-    private var clickLocked = false
-    private let clickThreshold = 0.5
-    
-    private var velocityX: CGFloat = 0
-    private let accelerationFactor: CGFloat = 5    // tweak this to taste
-    private let friction: CGFloat = 0.85
+    // MARK: – Sensitivity (range in radians)
+    private var yawRange:   Double = 40 * .pi / 180  // default 40°
+    private var pitchRange: Double = 30 * .pi / 180  // default 30°
 
-    // MARK: – Startup
     func applicationDidFinishLaunching(_ notification: Notification) {
-        print("🔥 AppDelegate didFinishLaunching fired")
+        print("🔥 AppDelegate didFinishLaunching")
 
-        // Register for calibration notifications
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleCalibrateNotification),
-            name: .headMouseCalibrate,
-            object: nil
-        )
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(handleCalibrateNotification),
+                                               name: .headMouseCalibrate,
+                                               object: nil)
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(handleSensitivityChange(_:)),
+                                               name: .headMouseSensitivityChanged,
+                                               object: nil)
 
-        // Setup and start Core Motion
         guard motionManager.isDeviceMotionAvailable else {
             print("❌ Headphone motion not available")
             return
         }
+
         motionManager.delegate = self
-        motionManager.startDeviceMotionUpdates(to: queue) { [weak self] motion, _ in
+        // begin listening for connect/disconnect events
+        motionManager.startConnectionStatusUpdates()
+
+        // register key monitors for toggling head control (⌘⇧H)
+        NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.maybeHandleToggleEvent(event)
+            return event
+        }
+        NSEvent.addGlobalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            self?.maybeHandleToggleEvent(event)
+        }
+    }
+
+    // MARK: – CMHeadphoneMotionManagerDelegate
+
+    func headphoneMotionManagerDidConnect(_ manager: CMHeadphoneMotionManager) {
+        print("✅ AirPods connected — starting motion updates")
+        manager.startDeviceMotionUpdates(to: queue) { [weak self] motion, error in
             guard let self = self, let motion = motion else { return }
             self.currentMotion = motion
 
             DispatchQueue.main.async {
-                // Always log raw data
                 print("🎧 Motion — yaw: \(motion.attitude.yaw), pitch: \(motion.attitude.pitch)")
-
-                // Only update cursor once calibrated
                 guard self.isCalibrated else { return }
                 self.updateCursor(using: motion)
-                self.detectClick(using: motion)
             }
         }
     }
 
+    func headphoneMotionManagerDidDisconnect(_ manager: CMHeadphoneMotionManager) {
+        print("❌ AirPods disconnected — stopping motion updates")
+        manager.stopDeviceMotionUpdates()
+    }
+
     // MARK: – Calibration Handler
+
     @objc private func handleCalibrateNotification() {
         guard let motion = currentMotion else {
             print("⚠️ No motion data yet. Move your head around first!")
             return
         }
-
         calibrationYaw   = motion.attitude.yaw
         calibrationPitch = motion.attitude.pitch
         isCalibrated     = true
-
         print("🎯 Calibrated — yaw: \(calibrationYaw), pitch: \(calibrationPitch)")
     }
 
+    // MARK: – Sensitivity Handler
+
+    @objc private func handleSensitivityChange(_ notification: Notification) {
+        guard let info   = notification.userInfo,
+              let yawDeg   = info["yawRange"]   as? Double,
+              let pitchDeg = info["pitchRange"] as? Double
+        else { return }
+
+        yawRange   = yawDeg   * .pi / 180
+        pitchRange = pitchDeg * .pi / 180
+        print("🔧 Sensitivity updated — yawRange: \(yawDeg)°, pitchRange: \(pitchDeg)°")
+    }
+
     // MARK: – Cursor Movement
+
     private func updateCursor(using motion: CMDeviceMotion) {
+        // only move when calibrated and enabled
+        guard isCalibrated, isHeadControlEnabled else { return }
+
         let rawYaw   = motion.attitude.yaw   - calibrationYaw
         let rawPitch = motion.attitude.pitch - calibrationPitch
 
-        // map ±45° yaw and ±30° pitch into –1…1
-        let normX = -max(-1, min(1, rawYaw / (.pi/4)))
-        let normY = -max(-1, min(1, rawPitch / (.pi/6)))
+        let normX = -max(-1, min(1, rawYaw   / yawRange))
+        let normY = -max(-1, min(1, rawPitch / pitchRange))
 
         guard let screen = NSScreen.main else { return }
         let frame = screen.frame
@@ -95,56 +128,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, CMHeadphoneMotionManagerDele
         print("🔀 normX:\(normX.rounded(to:2)), normY:\(normY.rounded(to:2)) → \(newPos)")
 
         CGWarpMouseCursorPosition(newPos)
-        if let ev = CGEvent(
-            mouseEventSource: nil,
-            mouseType: .mouseMoved,
-            mouseCursorPosition: newPos,
-            mouseButton: .left
-        ) {
+        if let ev = CGEvent(mouseEventSource: nil,
+                            mouseType: .mouseMoved,
+                            mouseCursorPosition: newPos,
+                            mouseButton: .left) {
             ev.post(tap: .cghidEventTap)
         }
     }
 
-    // MARK: – Nod for Click
-    private func detectClick(using motion: CMDeviceMotion) {
-        let pitch = motion.attitude.pitch
-        if !clickLocked && (pitch - lastPitch) > clickThreshold {
-            let pt = NSEvent.mouseLocation
-            performClick(at: pt)
-            clickLocked = true
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) {
-                self.clickLocked = false
-            }
+    // MARK: – Key Toggle Handler
+
+    private func maybeHandleToggleEvent(_ event: NSEvent) {
+        let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if mods == [.command, .shift],
+           event.charactersIgnoringModifiers?.lowercased() == "h" {
+            toggleHeadControl()
         }
-        lastPitch = pitch
     }
 
-    private func performClick(at point: CGPoint) {
-        print("👉 Click at \(point)")
-        guard
-            let down = CGEvent(
-                mouseEventSource: nil,
-                mouseType: .leftMouseDown,
-                mouseCursorPosition: point,
-                mouseButton: .left
-            ),
-            let up = CGEvent(
-                mouseEventSource: nil,
-                mouseType: .leftMouseUp,
-                mouseCursorPosition: point,
-                mouseButton: .left
-            )
-        else { return }
-        down.post(tap: .cghidEventTap)
-        up.post(tap: .cghidEventTap)
-    }
-
-    // MARK: – CMHeadphoneMotionManagerDelegate
-    func headphoneMotionManagerDidConnect(_ manager: CMHeadphoneMotionManager) {
-        print("✅ AirPods connected")
-    }
-    func headphoneMotionManagerDidDisconnect(_ manager: CMHeadphoneMotionManager) {
-        print("❌ AirPods disconnected")
+    /// flip head-control on/off
+    private func toggleHeadControl() {
+        isHeadControlEnabled.toggle()
+        print("🕹 Head control \(isHeadControlEnabled ? "ENABLED" : "DISABLED")")
     }
 }
 
