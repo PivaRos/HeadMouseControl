@@ -2,10 +2,12 @@
 
 import Cocoa
 import CoreMotion
+import AVFoundation
 
 extension Notification.Name {
     static let headMouseCalibrate          = Notification.Name("HeadMouseControlCalibrate")
     static let headMouseSensitivityChanged = Notification.Name("HeadMouseControlSensitivityChanged")
+    static let pinchDetectionToggle        = Notification.Name("PinchDetectionToggle")
 }
 
 class AppDelegate: NSObject, NSApplicationDelegate, CMHeadphoneMotionManagerDelegate {
@@ -13,6 +15,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, CMHeadphoneMotionManagerDele
     private let motionManager = CMHeadphoneMotionManager()
     private let queue = OperationQueue()
     private var currentMotion: CMDeviceMotion?
+    
+    // Pinch detection manager
+    let pinchDetectionManager = PinchDetectionManager()
 
     /// whether we should control the cursor by head motion
     private var isHeadControlEnabled = false
@@ -37,6 +42,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, CMHeadphoneMotionManagerDele
                                                selector: #selector(handleSensitivityChange(_:)),
                                                name: .headMouseSensitivityChanged,
                                                object: nil)
+        NotificationCenter.default.addObserver(self,
+                                               selector: #selector(handlePinchDetectionToggle),
+                                               name: .pinchDetectionToggle,
+                                               object: nil)
 
         guard motionManager.isDeviceMotionAvailable else {
             print("❌ Headphone motion not available")
@@ -46,6 +55,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, CMHeadphoneMotionManagerDele
         motionManager.delegate = self
         // begin listening for connect/disconnect events
         motionManager.startConnectionStatusUpdates()
+        
+        // Force camera permission check on app launch
+        checkCameraPermission()
 
         // register key monitors for toggling head control (⌘⇧H)
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -89,6 +101,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, CMHeadphoneMotionManagerDele
         calibrationPitch = motion.attitude.pitch
         isCalibrated     = true
         print("🎯 Calibrated — yaw: \(calibrationYaw), pitch: \(calibrationPitch)")
+    }
+    
+    // MARK: - Pinch Detection Handler
+    
+    @objc private func handlePinchDetectionToggle() {
+        pinchDetectionManager.togglePinchDetection()
+        print("👌 Pinch detection \(pinchDetectionManager.isPinchDetectionEnabled ? "ENABLED" : "DISABLED")")
     }
 
     // MARK: – Sensitivity Handler
@@ -142,7 +161,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, CMHeadphoneMotionManagerDele
         let mods = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
         if mods == [.command, .shift],
            event.charactersIgnoringModifiers?.lowercased() == "h" {
+            // Toggle both head control and pinch detection
             toggleHeadControl()
+            NotificationCenter.default.post(name: .pinchDetectionToggle, object: nil)
+            print("🎮 Toggled BOTH head control and pinch detection with ⌘⇧H")
+        } else if mods == [.command, .shift],
+                  event.charactersIgnoringModifiers?.lowercased() == "p" {
+            // Keep separate pinch detection toggle shortcut as well
+            NotificationCenter.default.post(name: .pinchDetectionToggle, object: nil)
         }
     }
 
@@ -150,6 +176,27 @@ class AppDelegate: NSObject, NSApplicationDelegate, CMHeadphoneMotionManagerDele
     private func toggleHeadControl() {
         isHeadControlEnabled.toggle()
         print("🕹 Head control \(isHeadControlEnabled ? "ENABLED" : "DISABLED")")
+    }
+
+    // MARK: - Camera Permission Check
+    private func checkCameraPermission() {
+        let status = AVCaptureDevice.authorizationStatus(for: .video)
+        if status == .notDetermined {
+            print("📷 Requesting camera permission on app launch")
+            AVCaptureDevice.requestAccess(for: .video) { granted in
+                print("📷 Camera permission \(granted ? "granted" : "denied")")
+                
+                if granted {
+                    DispatchQueue.main.async {
+                        // Initialize camera for pinch detection after permission granted
+                        self.pinchDetectionManager.setupCamera()
+                    }
+                }
+            }
+        } else {
+            // Initialize camera for pinch detection if we already have permission
+            pinchDetectionManager.setupCamera()
+        }
     }
 }
 
